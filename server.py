@@ -55,14 +55,14 @@ def build_status_line(code, reason):
 def safe_path_join(resources_dir, requested_path):
     """
     Canonicalize and ensure requested_path is within resources_dir.
-    requested_path is the path component (e.g. "/about.html" or "/images/pic.png")
+    Explicitly reject path traversal attempts and unsafe patterns.
     """
-    # Reject explicit traversal tokens early
-    if ".." in requested_path or requested_path.startswith("//") or requested_path.startswith("///"):
+    # Reject traversal attempts early
+    if ".." in requested_path or "./" in requested_path or requested_path.startswith("//") or requested_path.startswith("///"):
         return None
     # strip leading slash
     relative = requested_path.lstrip("/")
-    # Avoid absolute paths from client
+    # Avoid absolute paths
     if os.path.isabs(relative):
         return None
     # join and canonicalize
@@ -181,19 +181,13 @@ class HTTPHandler:
                     self.handle_post(path_raw, version, headers, body)
                 else:
                     self.send_error(405, "Method Not Allowed", f"{method} not supported")
-                    # per requirement only GET & POST allowed
                 self.request_count += 1
 
-                # Close if reached max requests allowed
                 if self.request_count >= PERSISTENT_MAX_REQUESTS:
                     logger.info("Max requests reached for persistent connection, closing")
                     break
-
-                # If the request asks for close, break after sending
                 if not self.keep_alive:
                     break
-
-                # else continue loop waiting for next request; reset timeout
                 self.conn.settimeout(PERSISTENT_TIMEOUT)
 
         except Exception as e:
@@ -218,7 +212,7 @@ class HTTPHandler:
         if path == "/":
             path = "/index.html"
 
-        # Path traversal protection & canonicalization
+        # Path traversal protection
         target = safe_path_join(self.resources_dir, path)
         if target is None:
             logger.warning(f"Path traversal attempt or bad path: {path}")
@@ -229,11 +223,9 @@ class HTTPHandler:
             self.send_error(404, "Not Found", "Requested resource doesn't exist.")
             return
 
-        # Content-type handling
         filename = os.path.basename(target)
         ext = os.path.splitext(filename)[1].lower()
         if ext == ".html":
-            # Serve HTML renderable
             with open(target, "rb") as f:
                 body = f.read()
             headers_out = {
@@ -249,37 +241,31 @@ class HTTPHandler:
             logger.info(f"Sending HTML file: {filename} ({len(body)} bytes)")
             return
         elif ext in (".png", ".jpg", ".jpeg", ".txt"):
-            # Binary download
-            # Allowed types: .png, .jpg/.jpeg, .txt => application/octet-stream
-            with open(target, "rb") as f:
-                size = os.path.getsize(target)
-                # Send header first then stream file in chunks
-                headers_out = {
-                    "Content-Type": "application/octet-stream",
-                    "Content-Length": str(size),
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Date": http_date_now(),
-                    "Server": SERVER_NAME,
-                    "Connection": "keep-alive" if self.keep_alive else "close"
-                }
-                if self.keep_alive:
-                    headers_out["Keep-Alive"] = f"timeout={PERSISTENT_TIMEOUT}, max={PERSISTENT_MAX_REQUESTS}"
-                # Write headers, then stream
-                header_bytes = self.build_headers_bytes(200, "OK", headers_out)
-                send_all(self.conn, header_bytes)
-                logger.info(f"Sending binary file: {filename} ({size} bytes)")
-                # stream
-                with open(target, "rb") as stream:
-                    sent = 0
-                    chunk_size = 8192
-                    while True:
-                        chunk = stream.read(chunk_size)
-                        if not chunk:
-                            break
-                        send_all(self.conn, chunk)
-                        sent += len(chunk)
-                logger.info(f"Response: 200 OK ({size} bytes transferred)")
-                return
+            size = os.path.getsize(target)
+            headers_out = {
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(size),
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Date": http_date_now(),
+                "Server": SERVER_NAME,
+                "Connection": "keep-alive" if self.keep_alive else "close"
+            }
+            if self.keep_alive:
+                headers_out["Keep-Alive"] = f"timeout={PERSISTENT_TIMEOUT}, max={PERSISTENT_MAX_REQUESTS}"
+            header_bytes = self.build_headers_bytes(200, "OK", headers_out)
+            send_all(self.conn, header_bytes)
+            logger.info(f"Sending binary file: {filename} ({size} bytes)")
+            with open(target, "rb") as stream:
+                chunk_size = 8192
+                sent = 0
+                while True:
+                    chunk = stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    send_all(self.conn, chunk)
+                    sent += len(chunk)
+            logger.info(f"Response: 200 OK ({size} bytes transferred)")
+            return
         else:
             self.send_error(415, "Unsupported Media Type", "File type not supported.")
             return
@@ -288,11 +274,7 @@ class HTTPHandler:
         parsed = urlparse(path_raw)
         path = unquote(parsed.path)
 
-        # POST allowed only for /upload (assignment implies POST /upload)
-        # but we'll allow POST to any path that maps into /resources/uploads/
         if path != "/upload" and not path.startswith("/uploads"):
-            # We'll accept only /upload -> creates file in resources/uploads/
-            # Others: 404
             self.send_error(404, "Not Found", "POST target not found")
             return
 
@@ -301,7 +283,6 @@ class HTTPHandler:
             self.send_error(415, "Unsupported Media Type", "Only application/json accepted")
             return
 
-        # parse JSON
         try:
             payload = json.loads(body_bytes.decode("utf-8"))
         except Exception as e:
@@ -309,7 +290,6 @@ class HTTPHandler:
             self.send_error(400, "Bad Request", "Invalid JSON")
             return
 
-        # prepare uploads dir
         uploads_dir = os.path.join(self.resources_dir, "uploads")
         os.makedirs(uploads_dir, exist_ok=True)
 
@@ -325,7 +305,6 @@ class HTTPHandler:
             self.send_error(500, "Internal Server Error", "Could not write file")
             return
 
-        # success 201
         response_body = json.dumps({
             "status": "success",
             "message": "File created successfully",
@@ -387,7 +366,6 @@ def worker_loop(conn_queue, resources_dir, server_hostport, stats):
             logger.exception("Unhandled exception in worker")
         finally:
             conn_queue.task_done()
-            # update active count safely
             with stats["lock"]:
                 stats["active"] -= 1
 
@@ -410,7 +388,6 @@ def main():
 
     server_hostport = f"{host}:{port}"
 
-    # start listening socket
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -421,11 +398,9 @@ def main():
     logger.info(f"Serving files from '{resources_dir}'")
     logger.info("Press Ctrl+C to stop the server")
 
-    # connection queue and stats
     conn_queue = queue.Queue(maxsize=CONN_QUEUE_MAX)
     stats = {"active": 0, "lock": threading.Lock()}
 
-    # spawn worker threads
     for i in range(pool_size):
         t = threading.Thread(target=worker_loop, name=f"Thread-{i+1}", args=(conn_queue, resources_dir, server_hostport, stats), daemon=True)
         t.start()
@@ -434,11 +409,9 @@ def main():
         while True:
             try:
                 conn, addr = srv.accept()
-                # if queue is full, reply 503 and close immediately
                 if conn_queue.full():
                     logger.warning("Thread pool saturated, rejecting connection with 503")
                     try:
-                        # Construct 503 response with Retry-After
                         body = b"<html><body><h1>503 Service Unavailable</h1><p>Server busy. Try again later.</p></body></html>"
                         headers = {
                             "Content-Type": "text/html; charset=utf-8",
@@ -456,10 +429,8 @@ def main():
                         conn.close()
                     continue
 
-                # log queueing condition (heuristic)
                 if conn_queue.qsize() >= pool_size:
                     logger.warning("Thread pool saturated, queuing connection")
-                # enqueue connection; worker will decrement active count when done
                 with stats["lock"]:
                     stats["active"] += 1
                 conn_queue.put((conn, addr))
